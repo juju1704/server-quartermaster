@@ -1,0 +1,46 @@
+{
+  "services": [
+    {
+      "name": "omniroute",
+      "policy": "auto",
+      "type": "docker",
+      "description": "AI router proxy (OpenAI-compatible)",
+      "cwd": "/home/juju/juju-projects",
+      "timeout_sec": 180,
+      "probe_cmd": "docker inspect -f '{{.State.Health.Status}}' omniroute 2>/dev/null || curl -fsS http://127.0.0.1:20128/healthz",
+      "update_cmd": "docker compose pull omniroute && docker compose up -d --wait --wait-timeout 60 omniroute",
+      "healthcheck_cmd": "curl -fsS http://127.0.0.1:20128/healthz"
+    },
+    {
+      "name": "orca",
+      "policy": "auto",
+      "type": "make",
+      "description": "Orca Headless Server (AppImage)",
+      "cwd": "/home/juju/juju-projects/repo/orca-headless-server",
+      "timeout_sec": 420,
+      "probe_cmd": "bash -c 'CUR=$(cat /opt/orca/VERSION 2>/dev/null || echo unknown); LATEST=$(curl -fsSL -o /dev/null -w \"%{url_effective}\" https://github.com/stablyai/orca/releases/latest 2>/dev/null | sed \"s|.*/tag/||\"); if [ -n \"$LATEST\" ] && [ \"$CUR\" != \"$LATEST\" ]; then echo \"NEW_VERSION:$CUR->$LATEST\"; else echo \"UP_TO_DATE:$CUR\"; fi'",
+      "update_cmd": "make update",
+      "healthcheck_cmd": "systemctl is-active orca-serve.service"
+    },
+    {
+      "name": "omp",
+      "policy": "auto",
+      "type": "cli_self_update",
+      "description": "Oh My Pi Agent CLI Harness",
+      "timeout_sec": 120,
+      "version_cmd": "/home/juju/.local/bin/omp --version",
+      "update_cmd": "/home/juju/.local/bin/omp update",
+      "healthcheck_cmd": "/home/juju/.local/bin/omp --version"
+    },
+    {
+      "name": "ak",
+      "policy": "auto",
+      "type": "cli_self_update",
+      "description": "AgentKit Tooling & Framework",
+      "timeout_sec": 120,
+      "version_cmd": "/home/juju/.local/bin/ak --version",
+      "update_cmd": "/home/juju/.local/bin/ak update --yes --global",
+      "healthcheck_cmd": "/home/juju/.local/bin/ak --version"
+    }
+  ]
+}
