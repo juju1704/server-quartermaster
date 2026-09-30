@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Server Quartermaster — Kỹ Sư Trưởng Cập Nhật & Bảo Trì Hệ Thống (09:00 AM)
-Đọc cấu hình từ ~/.workspace/config/updater_registry.json, thực thi tuần tự an toàn,
-kiểm tra healthcheck và gửi bản tin tổng hợp HTML về Telegram.
+Hỗ trợ cả 2 chế độ:
+  1. CLI Subcommands:
+       - `python3 main.py run` (mặc định): Chạy live run cập nhật và báo cáo Telegram.
+       - `python3 main.py info`: Scout trạng thái hiện tại của hệ thống (read-only) và in kết quả.
+       - `python3 main.py update`: Quét và ép cập nhật ngay lập tức.
+       - `python3 main.py listen`: Chạy daemon bot Telegram tiếp nhận lệnh /info và /update 24/7.
 """
 
 import sys
@@ -33,10 +37,10 @@ def load_env():
                 env_vars[k.strip()] = v.strip().strip('"').strip("'")
     return env_vars
 
-def send_telegram_report(report_text: str) -> bool:
+def send_telegram_report(report_text: str, custom_chat_id: str = None) -> bool:
     env_vars = load_env()
-    token = env_vars.get("QUARTERMASTER_TELEGRAM_BOT_TOKEN") or os.getenv("QUARTERMASTER_TELEGRAM_BOT_TOKEN")
-    chat_id = env_vars.get("TELEGRAM_ADMIN_CHAT_ID") or os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+    token = env_vars.get("TELEGRAM_BOT_TOKEN") or env_vars.get("QUARTERMASTER_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("QUARTERMASTER_TELEGRAM_BOT_TOKEN")
+    chat_id = custom_chat_id or env_vars.get("TELEGRAM_ADMIN_CHAT_ID") or os.getenv("TELEGRAM_ADMIN_CHAT_ID")
 
     if not token or not chat_id:
         print("[Quartermaster] Notice: ~/.workspace/quartermaster.env chưa được cấu hình. Bỏ qua gửi Telegram.")
@@ -73,10 +77,6 @@ def send_telegram_report(report_text: str) -> bool:
         return False
 
 def run_cmd(cmd: str, cwd: str = None, timeout: int = 60) -> tuple[int, str, str]:
-    """
-    Thực thi lệnh với process group riêng biệt.
-    Nếu timeout, gửi SIGTERM đến toàn bộ process group để tránh mồ côi cháu (grandchildren).
-    """
     try:
         proc = subprocess.Popen(
             cmd,
@@ -119,7 +119,6 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
     }
 
     if dry_run:
-        print(f"==> [DRY-RUN] Kiểm tra dịch vụ: {name} ({svc_type}, policy: {policy})")
         if svc.get("probe_cmd"):
             code, out, _ = run_cmd(svc["probe_cmd"], cwd=cwd, timeout=timeout)
             if "NEW_VERSION:" in out:
@@ -129,17 +128,15 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
                 result["status"] = "UP_TO_DATE"
                 result["detail"] = out.replace("UP_TO_DATE:", "Hiện tại: ")
             else:
-                result["detail"] = f"Probe exit {code}: {out}"
+                result["detail"] = f"Probe: {out}"
         elif svc.get("version_cmd"):
             _, out, _ = run_cmd(svc["version_cmd"], cwd=cwd, timeout=timeout)
-            result["detail"] = f"Current version: {out}"
+            result["detail"] = f"Version: {out}"
         else:
-            result["detail"] = "Ready (dry-run)"
+            result["detail"] = "Ready"
         return result
 
-    print(f"==> Đang kiểm tra & xử lý: {name} (policy: {policy})")
-
-    # 1. Chạy Probe nếu có
+    # Chạy Probe nếu có
     probe_cmd = svc.get("probe_cmd")
     has_new_version = False
     probe_up_to_date = False
@@ -155,7 +152,7 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
         else:
             result["detail"] = out[:100]
 
-    # 2. Xử lý Policy alert
+    # Xử lý Policy alert
     if policy == "alert":
         if has_new_version:
             result["status"] = "ALERT"
@@ -163,7 +160,7 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
             result["status"] = "UP_TO_DATE"
         return result
 
-    # 3. Xử lý Policy auto
+    # Xử lý Policy auto
     if svc_type == "cli_self_update":
         ver_cmd = svc.get("version_cmd")
         old_ver = ""
@@ -189,14 +186,13 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
             result["detail"] = new_ver or "Đang ở bản mới nhất"
 
     elif svc_type in ("docker", "make", "generic"):
-        # Nếu probe đã xác nhận dịch vụ đang ở bản mới nhất, kiểm tra healthcheck rồi giữ UP_TO_DATE
         if probe_up_to_date:
             hc_cmd = svc.get("healthcheck_cmd")
             if hc_cmd:
                 hc_code, hc_out, hc_err = run_cmd(hc_cmd, cwd=cwd, timeout=30)
                 if hc_code != 0:
                     result["status"] = "FAILED"
-                    result["error"] = f"Service không hoạt động (Healthcheck failed: {hc_err or hc_out})"
+                    result["error"] = f"Healthcheck failed: {hc_err or hc_out}"
                     return result
             result["status"] = "UP_TO_DATE"
             return result
@@ -215,7 +211,6 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
                 run_cmd("sudo systemctl start orca-serve.service", timeout=30)
             return result
 
-        # Chạy healthcheck
         hc_cmd = svc.get("healthcheck_cmd")
         if hc_cmd:
             time.sleep(3)
@@ -227,7 +222,6 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
                     run_cmd("sudo systemctl start orca-serve.service", timeout=30)
                 return result
 
-        # Kiểm tra output xem có thực sự update hay không
         combined_out = (out + " " + err).lower()
         no_change_markers = [
             "already up to date",
@@ -246,29 +240,26 @@ def process_service(svc: dict, dry_run: bool = False) -> dict:
 
     return result
 
-def main():
-    dry_run = "--dry-run" in sys.argv
+def execute_engine(dry_run: bool = False, title_prefix: str = "Báo Cáo Cập Nhật Hạ Tầng") -> str:
     LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     lock_file = open(LOCK_PATH, "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        print("[Quartermaster] Một tiến trình Quartermaster khác đang chạy. Bỏ qua.")
-        sys.exit(0)
+        return "⚠️ Một tiến trình Quartermaster khác đang chạy. Bỏ qua."
 
     start_time = time.time()
-    print(f"=== BẮT ĐẦU QUARTERMASTER RUNNER ({'DRY-RUN' if dry_run else 'LIVE'}) ===")
-
     if not CONFIG_PATH.exists():
-        print(f"[Quartermaster] Lỗi: Không tìm thấy registry tại {CONFIG_PATH}")
-        sys.exit(1)
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+        return f"❌ Lỗi: Không tìm thấy registry tại {CONFIG_PATH}"
 
     try:
         config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception as e:
-        print(f"[Quartermaster] Lỗi parse JSON registry: {e}")
-        sys.exit(1)
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
+        return f"❌ Lỗi parse JSON registry: {e}"
 
     services = config.get("services", [])
     results = []
@@ -278,14 +269,11 @@ def main():
         results.append(res)
 
     elapsed = round(time.time() - start_time, 2)
-    print(f"=== HOÀN TẤT TRONG {elapsed}s ===")
-
-    # Format thời gian theo múi giờ Asia/Ho_Chi_Minh
     vn_tz = ZoneInfo("Asia/Ho_Chi_Minh")
-    now_str = datetime.now(vn_tz).strftime("%d/%m/%Y %H:%M")
+    now_str = datetime.now(vn_tz).strftime("%d/%m/%Y %H:%M:%S")
 
     report_lines = [
-        f"🛠️ <b>Báo Cáo Cập Nhật Hạ Tầng (09:00 AM)</b>",
+        f"🛠️ <b>{title_prefix}</b>",
         f"📅 <i>Thời gian: {now_str}</i>\n"
     ]
 
@@ -314,15 +302,125 @@ def main():
     report_lines.append(f"\n⏱️ <i>Thời gian thực thi: {elapsed}s</i>")
     final_report = "\n".join(report_lines)
 
-    print("\n--- BẢN TIN TELEGRAM DỰ KIẾN ---")
-    print(final_report)
-    print("--------------------------------\n")
-
-    if not dry_run:
-        send_telegram_report(final_report)
-
     fcntl.flock(lock_file, fcntl.LOCK_UN)
     lock_file.close()
+    return final_report
+
+def start_telegram_listener():
+    env_vars = load_env()
+    token = env_vars.get("TELEGRAM_BOT_TOKEN") or env_vars.get("QUARTERMASTER_TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("QUARTERMASTER_TELEGRAM_BOT_TOKEN")
+    admin_chat_id = env_vars.get("TELEGRAM_ADMIN_CHAT_ID") or os.getenv("TELEGRAM_ADMIN_CHAT_ID")
+
+    if not token:
+        print("[Quartermaster Listener] Lỗi: Chưa cấu hình TELEGRAM_BOT_TOKEN.")
+        sys.exit(1)
+
+    # Tự động đồng bộ danh sách lệnh lên Telegram API (hiển thị nút Menu trên app)
+    try:
+        cmd_url = f"https://api.telegram.org/bot{token}/setMyCommands"
+        cmd_payload = {
+            "commands": [
+                {"command": "info", "description": "Scout thông tin phiên bản & healthcheck hạ tầng (Read-only)"},
+                {"command": "update", "description": "Quét & ép cập nhật các dịch vụ ngay lập tức"},
+                {"command": "help", "description": "Hướng dẫn sử dụng và danh sách lệnh"}
+            ]
+        }
+        req_cmd = urllib.request.Request(
+            cmd_url,
+            data=json.dumps(cmd_payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req_cmd, timeout=10) as r:
+            if r.status == 200:
+                print("[Quartermaster Bot] Đã tự động đồng bộ danh sách lệnh lên Telegram Menu thành công.")
+    except Exception as e:
+        print(f"[Quartermaster Bot] Cảnh báo: Không thể đồng bộ commands lên Telegram: {e}")
+
+    print(f"==> [Quartermaster Bot] Bắt đầu Long Polling nhận lệnh /info và /update...")
+    last_update_id = 0
+
+    while True:
+        try:
+            url = f"https://api.telegram.org/bot{token}/getUpdates?offset={last_update_id + 1}&timeout=30"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
+
+            for update in data.get("result", []):
+                update_id = update["update_id"]
+                if update_id > last_update_id:
+                    last_update_id = update_id
+
+                msg = update.get("message") or update.get("edited_message")
+                if not msg:
+                    continue
+
+                text = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+                from_user = msg.get("from", {}).get("username", "user")
+
+                # Chỉ nhận lệnh từ Admin Chat ID đã cấu hình
+                if admin_chat_id and chat_id != str(admin_chat_id):
+                    print(f"[Quartermaster Bot] Từ chối lệnh từ Chat ID lạ: {chat_id} (@{from_user})")
+                    continue
+
+                if text in ("/info", "/status"):
+                    print(f"[Quartermaster Bot] Nhận lệnh {text} từ @{from_user}")
+                    report = execute_engine(dry_run=True, title_prefix="Thông Tin Hạ Tầng Hiện Tại (/info)")
+                    send_telegram_report(report, custom_chat_id=chat_id)
+
+                elif text in ("/update", "/upgrade"):
+                    print(f"[Quartermaster Bot] Nhận lệnh {text} từ @{from_user}")
+                    send_telegram_report("⏳ <i>Đang bắt đầu quét và cập nhật hạ tầng...</i>", custom_chat_id=chat_id)
+                    report = execute_engine(dry_run=False, title_prefix="Báo Cáo Cập Nhật Hạ Tầng (/update)")
+                    send_telegram_report(report, custom_chat_id=chat_id)
+
+                elif text in ("/start", "/help"):
+                    help_msg = (
+                        "🛠️ <b>Quartermaster Bot Command Center</b>\n\n"
+                        "• <code>/info</code> : Scout thông tin phiên bản & health hiện tại (an toàn, không chạm vào service).\n"
+                        "• <code>/update</code> : Quét và ép cập nhật các dịch vụ ngay lập tức.\n"
+                        "• <code>/help</code> : Hiển thị bảng trợ giúp này."
+                    )
+                    send_telegram_report(help_msg, custom_chat_id=chat_id)
+
+        except Exception as e:
+            time.sleep(5)
+
+def main():
+    args = sys.argv[1:]
+
+    if "-h" in args or "--help" in args:
+        print("Sử dụng: python3 main.py [run|info|update|listen|--dry-run]")
+        print("  info     : Scout trạng thái các dịch vụ (read-only, an toàn).")
+        print("  update   : Thực thi cập nhật ngay lập tức và gửi báo cáo về Telegram.")
+        print("  listen   : Chạy bot Telegram Long Polling nhận lệnh /info và /update.")
+        print("  run      : Chạy live run định kỳ (mặc định của systemd).")
+        print("  --dry-run: Chế độ kiểm thử mô phỏng.")
+        sys.exit(0)
+
+    mode = args[0] if args else "run"
+
+    if mode == "info" or "--dry-run" in args:
+        report = execute_engine(dry_run=True, title_prefix="Thông Tin Hạ Tầng Hiện Tại (Info)")
+        print(report)
+    elif mode == "update":
+        report = execute_engine(dry_run=False, title_prefix="Báo Cáo Cập Nhật Hạ Tầng (Update)")
+        print(report)
+        send_telegram_report(report)
+    elif mode == "listen":
+        start_telegram_listener()
+    elif mode == "run":
+        report = execute_engine(dry_run=False, title_prefix="Báo Cáo Cập Nhật Hạ Tầng (09:00 AM)")
+        print(report)
+        send_telegram_report(report)
+    else:
+        print(f"Tham số không hợp lệ: {mode}. Dùng --help để xem hướng dẫn.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
